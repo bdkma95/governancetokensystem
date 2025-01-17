@@ -1,116 +1,142 @@
-pragma solidity ^0.4.24;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
 import "./EIP20Interface.sol";
 import "./WrappedEtherInterface.sol";
 import "./MoneyMarketInterface.sol";
-import "./SafeMath.sol";
 
 contract CDP {
-  using SafeMath for uint;
-  uint constant expScale = 10**18;
-  uint constant collateralRatioBuffer = 25 * 10 ** 16;
-  address creator;
-  address owner;
-  WrappedEtherInterface weth;
-  MoneyMarketInterface compoundMoneyMarket;
-  EIP20Interface borrowedToken;
+    uint256 constant expScale = 10**18;
+    uint256 constant collateralRatioBuffer = 25 * 10**16;
 
-  event Log(uint x, string m);
-  event Log(int x, string m);
+    address public creator;
+    address public owner;
+    WrappedEtherInterface public weth;
+    MoneyMarketInterface public compoundMoneyMarket;
+    EIP20Interface public borrowedToken;
 
-  constructor (address _owner, address tokenAddress, address wethAddress, address moneyMarketAddress) public {
-    creator = msg.sender;
-    owner = _owner;
-    borrowedToken = EIP20Interface(tokenAddress);
-    compoundMoneyMarket = MoneyMarketInterface(moneyMarketAddress);
-    weth = WrappedEtherInterface(wethAddress);
+    event Log(uint256 value, string message);
+    event LogInt(int256 value, string message);
+    event Funded(address indexed funder, uint256 amount);
+    event Repaid(address indexed repayer, uint256 amount);
+    event TokensTransferred(address indexed to, uint256 amount);
 
-    weth.approve(moneyMarketAddress, uint(-1));
-    borrowedToken.approve(compoundMoneyMarket, uint(-1));
-  }
-
-  /*
-    @dev called from borrow factory, wraps eth and supplies weth, then borrows
-     the token at address supplied in constructor
-  */
-  function fund() payable external {
-    require(creator == msg.sender);
-
-    weth.deposit.value(msg.value)();
-
-    uint supplyStatus = compoundMoneyMarket.supply(weth, msg.value);
-    require(supplyStatus == 0, "supply failed");
-
-    /* --------- borrow the tokens ----------- */
-    uint collateralRatio = compoundMoneyMarket.collateralRatio();
-    (uint status , uint totalSupply, uint totalBorrow) = compoundMoneyMarket.calculateAccountValues(address(this));
-    require(status == 0, "calculating account values failed");
-
-    uint availableBorrow = findAvailableBorrow(totalSupply, totalBorrow, collateralRatio);
-
-    uint assetPrice = compoundMoneyMarket.assetPrices(borrowedToken);
-    /*
-      available borrow & asset price are both scaled 10e18, so include extra
-      scale in numerator dividing asset to keep it there
-    */
-    uint tokenAmount = availableBorrow.mul(expScale).div(assetPrice);
-    uint borrowStatus = compoundMoneyMarket.borrow(borrowedToken, tokenAmount);
-    require(borrowStatus == 0, "borrow failed");
-
-    /* ---------- sweep tokens to user ------------- */
-    uint borrowedTokenBalance = borrowedToken.balanceOf(address(this));
-    borrowedToken.transfer(owner, borrowedTokenBalance);
-  }
-
-
-  /* @dev the factory contract will transfer tokens necessary to repay */
-  function repay() external {
-    require(creator == msg.sender);
-
-    uint repayStatus = compoundMoneyMarket.repayBorrow(borrowedToken, uint(-1));
-    require(repayStatus == 0, "repay failed");
-
-    /* ---------- withdraw excess collateral weth ------- */
-    uint collateralRatio = compoundMoneyMarket.collateralRatio();
-    (uint status , uint totalSupply, uint totalBorrow) = compoundMoneyMarket.calculateAccountValues(address(this));
-    require(status == 0, "calculating account values failed");
-
-    uint amountToWithdraw;
-    if (totalBorrow == 0) {
-      amountToWithdraw = uint(-1);
-    } else {
-      amountToWithdraw = findAvailableWithdrawal(totalSupply, totalBorrow, collateralRatio);
+    modifier onlyCreator() {
+        require(msg.sender == creator, "CDP: Caller is not the creator");
+        _;
     }
 
-    uint withdrawStatus = compoundMoneyMarket.withdraw(weth, amountToWithdraw);
-    require(withdrawStatus == 0 , "withdrawal failed");
+    constructor(
+        address _owner,
+        address tokenAddress,
+        address wethAddress,
+        address moneyMarketAddress
+    ) {
+        creator = msg.sender;
+        owner = _owner;
+        borrowedToken = EIP20Interface(tokenAddress);
+        compoundMoneyMarket = MoneyMarketInterface(moneyMarketAddress);
+        weth = WrappedEtherInterface(wethAddress);
 
-    /* ---------- return ether to user ---------*/
-    uint wethBalance = weth.balanceOf(address(this));
-    weth.withdraw(wethBalance);
-    owner.transfer(address(this).balance);
-  }
-
-  /* @dev returns borrow value in eth scaled to 10e18 */
-  function findAvailableBorrow(uint currentSupplyValue, uint currentBorrowValue, uint collateralRatio) public pure returns (uint) {
-    uint totalPossibleBorrow = currentSupplyValue.mul(expScale).div(collateralRatio.add(collateralRatioBuffer));
-    if ( totalPossibleBorrow > currentBorrowValue ) {
-      return totalPossibleBorrow.sub(currentBorrowValue).div(expScale);
-    } else {
-      return 0;
+        // Approve maximum spending for WETH and borrowed tokens
+        weth.approve(moneyMarketAddress, type(uint256).max);
+        borrowedToken.approve(moneyMarketAddress, type(uint256).max);
     }
-  }
 
-  /* @dev returns available withdrawal in eth scale to 10e18 */
-  function findAvailableWithdrawal(uint currentSupplyValue, uint currentBorrowValue, uint collateralRatio) public pure returns (uint) {
-    uint requiredCollateralValue = currentBorrowValue.mul(collateralRatio.add(collateralRatioBuffer)).div(expScale);
-    if ( currentSupplyValue > requiredCollateralValue ) {
-      return currentSupplyValue.sub(requiredCollateralValue).div(expScale);
-    } else {
-      return 0;
+    /**
+     * @dev Wraps ETH, supplies WETH, and borrows tokens.
+     */
+    function fund() external payable onlyCreator {
+        require(msg.value > 0, "CDP: Must send ETH to fund");
+
+        // Deposit ETH and convert to WETH
+        weth.deposit{value: msg.value}();
+
+        // Supply WETH to the money market
+        uint256 supplyStatus = compoundMoneyMarket.supply(address(weth), msg.value);
+        require(supplyStatus == 0, "CDP: Supply to money market failed");
+
+        // Calculate available borrow
+        uint256 collateralRatio = compoundMoneyMarket.collateralRatio();
+        (uint256 status, uint256 totalSupply, uint256 totalBorrow) = compoundMoneyMarket.calculateAccountValues(address(this));
+        require(status == 0, "CDP: Failed to calculate account values");
+
+        uint256 availableBorrow = findAvailableBorrow(totalSupply, totalBorrow, collateralRatio);
+        uint256 assetPrice = compoundMoneyMarket.assetPrices(address(borrowedToken));
+        uint256 tokenAmount = availableBorrow * expScale / assetPrice;
+
+        // Borrow tokens
+        uint256 borrowStatus = compoundMoneyMarket.borrow(address(borrowedToken), tokenAmount);
+        require(borrowStatus == 0, "CDP: Borrow failed");
+
+        // Transfer borrowed tokens to the owner
+        uint256 borrowedTokenBalance = borrowedToken.balanceOf(address(this));
+        borrowedToken.transfer(owner, borrowedTokenBalance);
+
+        emit Funded(msg.sender, msg.value);
+        emit TokensTransferred(owner, borrowedTokenBalance);
     }
-  }
 
-  /* @dev it is necessary to accept eth to unwrap weth */
-  function () public payable {}
+    /**
+     * @dev Repays the borrowed tokens and withdraws excess collateral.
+     */
+    function repay() external onlyCreator {
+        // Repay the borrowed tokens
+        uint256 repayStatus = compoundMoneyMarket.repayBorrow(address(borrowedToken), type(uint256).max);
+        require(repayStatus == 0, "CDP: Repay failed");
+
+        // Calculate excess collateral and withdraw
+        uint256 collateralRatio = compoundMoneyMarket.collateralRatio();
+        (uint256 status, uint256 totalSupply, uint256 totalBorrow) = compoundMoneyMarket.calculateAccountValues(address(this));
+        require(status == 0, "CDP: Failed to calculate account values");
+
+        uint256 amountToWithdraw = totalBorrow == 0
+            ? type(uint256).max
+            : findAvailableWithdrawal(totalSupply, totalBorrow, collateralRatio);
+
+        uint256 withdrawStatus = compoundMoneyMarket.withdraw(address(weth), amountToWithdraw);
+        require(withdrawStatus == 0, "CDP: Withdraw failed");
+
+        // Convert WETH back to ETH and transfer to the owner
+        uint256 wethBalance = weth.balanceOf(address(this));
+        weth.withdraw(wethBalance);
+        payable(owner).transfer(address(this).balance);
+
+        emit Repaid(msg.sender, amountToWithdraw);
+    }
+
+    /**
+     * @dev Calculates the available borrow value in ETH (scaled to 10**18).
+     */
+    function findAvailableBorrow(
+        uint256 currentSupplyValue,
+        uint256 currentBorrowValue,
+        uint256 collateralRatio
+    ) public pure returns (uint256) {
+        uint256 totalPossibleBorrow = currentSupplyValue * expScale / (collateralRatio + collateralRatioBuffer);
+        return totalPossibleBorrow > currentBorrowValue
+            ? (totalPossibleBorrow - currentBorrowValue) / expScale
+            : 0;
+    }
+
+    /**
+     * @dev Calculates the available withdrawal value in ETH (scaled to 10**18).
+     */
+    function findAvailableWithdrawal(
+        uint256 currentSupplyValue,
+        uint256 currentBorrowValue,
+        uint256 collateralRatio
+    ) public pure returns (uint256) {
+        uint256 requiredCollateralValue = currentBorrowValue * (collateralRatio + collateralRatioBuffer) / expScale;
+        return currentSupplyValue > requiredCollateralValue
+            ? (currentSupplyValue - requiredCollateralValue) / expScale
+            : 0;
+    }
+
+    /**
+     * @dev Required to accept ETH for unwrapping WETH.
+     */
+    receive() external payable {}
+
+    fallback() external payable {}
 }
