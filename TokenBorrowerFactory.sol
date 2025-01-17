@@ -1,73 +1,105 @@
-pragma solidity ^0.4.24;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
 import "./MoneyMarketInterface.sol";
 import "./CDP.sol";
 import "./EIP20Interface.sol";
 
 contract TokenBorrowerFactory {
-  address wethAddress;
-  MoneyMarketInterface compoundMoneyMarket;
-  EIP20Interface token;
+    address public wethAddress;
+    MoneyMarketInterface public compoundMoneyMarket;
+    EIP20Interface public token;
 
-  mapping(address => CDP) public borrowers;
+    mapping(address => CDP) public borrowers;
 
-  constructor(address weth, address _token, address moneyMarket) public {
-    wethAddress = weth;
-    token = EIP20Interface(_token);
-    compoundMoneyMarket = MoneyMarketInterface(moneyMarket);
-  }
+    /**
+     * @dev Constructor to initialize the factory.
+     * @param weth The address of the Wrapped ETH contract.
+     * @param _token The address of the ERC20 token to be borrowed.
+     * @param moneyMarket The address of the money market (Compound).
+     */
+    constructor(address weth, address _token, address moneyMarket) {
+        require(weth != address(0), "Invalid WETH address");
+        require(_token != address(0), "Invalid token address");
+        require(moneyMarket != address(0), "Invalid money market address");
 
-  /*
-    @notice will deploy a new borrower contract or add funds to an existing one.
-    The caller will receive the proceeds of the executed borrow, with a supply
-    25% higher than required collateral ratio ( supply / borrow ) being
-    targeted. If the additional funds do not put the user in excess of this
-    collateral ratio, no borrow will be executed and no tokens will be received.
-  */
-  function() payable public {
-    CDP cdp;
-    if (borrowers[msg.sender] == address(0x0)) {
-      // create borrower contract if none exists
-       cdp = new CDP(msg.sender, token, wethAddress, compoundMoneyMarket);
-       borrowers[msg.sender] = cdp;
-    } else {
-      cdp = borrowers[msg.sender];
+        wethAddress = weth;
+        token = EIP20Interface(_token);
+        compoundMoneyMarket = MoneyMarketInterface(moneyMarket);
     }
 
-    cdp.fund.value(msg.value)();
-  }
+    /**
+     * @notice Deploys a new CDP or adds funds to an existing one.
+     * @dev The caller will receive borrowed tokens if their collateral ratio permits.
+     */
+    receive() external payable {
+        require(msg.value > 0, "Must send ETH to fund");
 
-  /*
-    @notice User must approve this contract to transfer the erc 20 token being
-     borrowed. Calling this function will repay entire borrow if allowance
-     exceeds what is owed, othewise will repay the allowance. The caller will
-     receive any excess ether if they are overcollateralized after repaying the
-     borrow.
-  */
-  function repay() public {
-    CDP cdp = borrowers[msg.sender];
-    uint allowance = token.allowance(msg.sender, address(this));
-    uint borrowBalance = compoundMoneyMarket.getBorrowBalance(cdp, token);
-    uint userTokenBalance = token.balanceOf(msg.sender);
-    uint transferAmount = min(min(allowance, borrowBalance), userTokenBalance);
+        CDP cdp;
+        if (address(borrowers[msg.sender]) == address(0)) {
+            // Create a new CDP for the sender
+            cdp = new CDP(msg.sender, address(token), wethAddress, address(compoundMoneyMarket));
+            borrowers[msg.sender] = cdp;
+        } else {
+            // Use the existing CDP
+            cdp = borrowers[msg.sender];
+        }
 
-    token.transferFrom(msg.sender, cdp, transferAmount);
-    cdp.repay();
-  }
-
-  function min(uint a, uint b) private pure returns ( uint ) {
-    if (a <= b) {
-      return a;
-    } else {
-      return b;
+        // Fund the CDP with the sent ETH
+        cdp.fund{value: msg.value}();
     }
-  }
 
-  function getBorrowBalance(address user) view public returns (uint) {
-    return compoundMoneyMarket.getBorrowBalance(borrowers[user], token);
-  }
+    /**
+     * @notice Repays the user's borrow.
+     * @dev The user must approve this contract to transfer the borrowed tokens.
+     */
+    function repay() external {
+        CDP cdp = borrowers[msg.sender];
+        require(address(cdp) != address(0), "No CDP exists for user");
 
-  function getSupplyBalance(address user) view public returns (uint) {
-    return compoundMoneyMarket.getSupplyBalance(borrowers[user], wethAddress);
-  }
+        uint256 allowance = token.allowance(msg.sender, address(this));
+        uint256 borrowBalance = compoundMoneyMarket.getBorrowBalance(address(cdp), address(token));
+        uint256 userTokenBalance = token.balanceOf(msg.sender);
+
+        uint256 transferAmount = _min(_min(allowance, borrowBalance), userTokenBalance);
+        require(transferAmount > 0, "No tokens to repay");
+
+        // Transfer tokens from user to CDP
+        bool success = token.transferFrom(msg.sender, address(cdp), transferAmount);
+        require(success, "Token transfer failed");
+
+        // Repay the borrow
+        cdp.repay();
+    }
+
+    /**
+     * @dev Returns the borrow balance of a user.
+     * @param user The address of the user.
+     */
+    function getBorrowBalance(address user) external view returns (uint256) {
+        CDP cdp = borrowers[user];
+        require(address(cdp) != address(0), "No CDP exists for user");
+
+        return compoundMoneyMarket.getBorrowBalance(address(cdp), address(token));
+    }
+
+    /**
+     * @dev Returns the supply balance of a user.
+     * @param user The address of the user.
+     */
+    function getSupplyBalance(address user) external view returns (uint256) {
+        CDP cdp = borrowers[user];
+        require(address(cdp) != address(0), "No CDP exists for user");
+
+        return compoundMoneyMarket.getSupplyBalance(address(cdp), wethAddress);
+    }
+
+    /**
+     * @dev Internal function to find the minimum of two values.
+     * @param a First value.
+     * @param b Second value.
+     */
+    function _min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
 }
